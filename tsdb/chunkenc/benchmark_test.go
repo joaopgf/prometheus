@@ -19,13 +19,16 @@ import (
 	"io"
 	"math/rand"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/prometheus/prometheus/model/timestamp"
 )
 
 type sampleCase struct {
 	name    string
-	samples []pair
+	samples []triple
 }
 
 type fmtCase struct {
@@ -36,44 +39,124 @@ type fmtCase struct {
 func foreachFmtSampleCase(b *testing.B, fn func(b *testing.B, f fmtCase, s sampleCase)) {
 	const nSamples = 120 // Same as tsdb.DefaultSamplesPerChunk.
 
+	d, err := time.Parse(time.DateTime, "2025-11-04 10:01:05")
+	require.NoError(b, err)
+
 	var (
-		r     = rand.New(rand.NewSource(1))
-		initT = int64(1234123324)
-		initV = 1243535.123
+		r      = rand.New(rand.NewSource(1))
+		initST = timestamp.FromTime(d) // Use realistic timestamp.
+		initT  = initST + 15000        // 15s after initST.
+		initV  = 1243535.123
 	)
 
 	sampleCases := []sampleCase{
 		{
-			name: "constant",
-			samples: func() (ret []pair) {
+			name: "vt=constant/st=0",
+			samples: func() (ret []triple) {
 				t, v := initT, initV
 				for range nSamples {
 					t += 1000
-					ret = append(ret, pair{t: t, v: v})
+					ret = append(ret, triple{st: 0, t: t, v: v})
 				}
 				return ret
 			}(),
 		},
 		{
-			name: "random steps",
-			samples: func() (ret []pair) {
+			// Cumulative with a constant ST through the whole chunk, typical case (e.g. long counting counter).
+			name: "vt=constant/st=cumulative",
+			samples: func() (ret []triple) {
+				t, v := initT, initV
+				for range nSamples {
+					t += 1000
+					ret = append(ret, triple{st: initST, t: t, v: v})
+				}
+				return ret
+			}(),
+		},
+		{
+			// Delta simulates delta type or worst case for cumulatives, where ST
+			// is changing on every sample.
+			name: "vt=constant/st=delta",
+			samples: func() (ret []triple) {
+				st, t, v := initST, initT, initV
+				for range nSamples {
+					st = t + 1 // ST is a tight interval after the last t+1ms.
+					t += 1000
+					ret = append(ret, triple{st: st, t: t, v: v})
+				}
+				return ret
+			}(),
+		},
+		{
+			name: "vt=random steps/st=0",
+			samples: func() (ret []triple) {
 				t, v := initT, initV
 				for range nSamples {
 					t += int64(r.Intn(100) - 50 + 15000) // 15 seconds +- up to 100ms of jitter.
 					v += float64(r.Intn(100) - 50)       // Varying from -50 to +50 in 100 discrete steps.
-					ret = append(ret, pair{t: t, v: v})
+					ret = append(ret, triple{st: 0, t: t, v: v})
 				}
 				return ret
 			}(),
 		},
 		{
-			name: "random 0-1",
-			samples: func() (ret []pair) {
+			name: "vt=random steps/st=cumulative",
+			samples: func() (ret []triple) {
+				t, v := initT, initV
+				for range nSamples {
+					t += int64(r.Intn(100) - 50 + 15000) // 15 seconds +- up to 100ms of jitter.
+					v += float64(r.Intn(100) - 50)       // Varying from -50 to +50 in 100 discrete steps.
+					ret = append(ret, triple{st: initST, t: t, v: v})
+				}
+				return ret
+			}(),
+		},
+		{
+			name: "vt=random steps/st=delta",
+			samples: func() (ret []triple) {
+				st, t, v := initST, initT, initV
+				for range nSamples {
+					st = t + 1                           // ST is a tight interval after the last t+1ms.
+					t += int64(r.Intn(100) - 50 + 15000) // 15 seconds +- up to 100ms of jitter.
+					v += float64(r.Intn(100) - 50)       // Varying from -50 to +50 in 100 discrete steps.
+					ret = append(ret, triple{st: st, t: t, v: v})
+				}
+				return ret
+			}(),
+		},
+		{
+			name: "vt=random 0-1/st=0",
+			samples: func() (ret []triple) {
 				t, v := initT, initV
 				for range nSamples {
 					t += int64(r.Intn(100) - 50 + 15000) // 15 seconds +- up to 100ms of jitter.
 					v += r.Float64()                     // Random between 0 and 1.0.
-					ret = append(ret, pair{t: t, v: v})
+					ret = append(ret, triple{st: 0, t: t, v: v})
+				}
+				return ret
+			}(),
+		},
+		{
+			name: "vt=random 0-1/st=cumulative",
+			samples: func() (ret []triple) {
+				t, v := initT, initV
+				for range nSamples {
+					t += int64(r.Intn(100) - 50 + 15000) // 15 seconds +- up to 100ms of jitter.
+					v += r.Float64()                     // Random between 0 and 1.0.
+					ret = append(ret, triple{st: initST, t: t, v: v})
+				}
+				return ret
+			}(),
+		},
+		{
+			name: "vt=random 0-1/st=delta",
+			samples: func() (ret []triple) {
+				st, t, v := initST, initT, initV
+				for range nSamples {
+					st = t + 1                           // ST is a tight interval after the last t+1ms.
+					t += int64(r.Intn(100) - 50 + 15000) // 15 seconds +- up to 100ms of jitter.
+					v += r.Float64()                     // Random between 0 and 1.0.
+					ret = append(ret, triple{st: st, t: t, v: v})
 				}
 				return ret
 			}(),
@@ -81,10 +164,11 @@ func foreachFmtSampleCase(b *testing.B, fn func(b *testing.B, f fmtCase, s sampl
 	}
 
 	for _, f := range []fmtCase{
-		{name: "XOR", newChunkFn: func() Chunk { return NewXORChunk() }},
+		{name: "XOR (ST ignored)", newChunkFn: func() Chunk { return NewXORChunk() }},
+		{name: "XORv2", newChunkFn: func() Chunk { return NewXORv2Chunk() }},
 	} {
 		for _, s := range sampleCases {
-			b.Run(fmt.Sprintf("fmt=%s/samples=%s", f.name, s.name), func(b *testing.B) {
+			b.Run(fmt.Sprintf("fmt=%s/%s", f.name, s.name), func(b *testing.B) {
 				fn(b, f, s)
 			})
 		}
@@ -94,7 +178,7 @@ func foreachFmtSampleCase(b *testing.B, fn func(b *testing.B, f fmtCase, s sampl
 /*
 	export bench=append && go test \
 	  -run '^$' -bench '^BenchmarkAppender' \
-	  -benchtime 5s -count 6 -cpu 2 -timeout 999m \
+	  -benchtime 2s -count 6 -cpu 2 -timeout 999m \
 	  | tee ${bench}.txt
 */
 func BenchmarkAppender(b *testing.B) {
@@ -104,22 +188,30 @@ func BenchmarkAppender(b *testing.B) {
 		for b.Loop() {
 			c := f.newChunkFn()
 
-			a, err := c.Appender()
+			newAppenderFn, _ := compatNewAppenderV2(c)
+			a, err := newAppenderFn()
 			if err != nil {
 				b.Fatalf("get appender: %s", err)
 			}
 			for _, p := range s.samples {
-				a.Append(p.t, p.v)
+				a.Append(p.st, p.t, p.v)
 			}
 			b.ReportMetric(float64(len(c.Bytes())), "B/chunk")
+
+			require.Equal(b, len(s.samples), c.NumSamples())
 		}
 	})
+}
+
+type supportsAppenderV2 interface {
+	// AppenderV2 returns an v2 appender to append samples to the chunk.
+	AppenderV2() (AppenderV2, error)
 }
 
 /*
 	export bench=iter && go test \
 	  -run '^$' -bench '^BenchmarkIterator' \
-	  -benchtime 5s -count 6 -cpu 2 -timeout 999m \
+	  -benchtime 2s -count 6 -cpu 2 -timeout 999m \
 	  | tee ${bench}.txt
 */
 func BenchmarkIterator(b *testing.B) {
@@ -127,18 +219,35 @@ func BenchmarkIterator(b *testing.B) {
 		b.ReportAllocs()
 
 		c := f.newChunkFn()
-		a, err := c.Appender()
+		newAppenderFn, stSupported := compatNewAppenderV2(c)
+		a, err := newAppenderFn()
 		if err != nil {
 			b.Fatalf("get appender: %s", err)
 		}
 		for _, p := range s.samples {
-			a.Append(p.t, p.v)
+			a.Append(p.st, p.t, p.v)
 		}
 
-		var (
-			sink float64
-			it   Iterator
-		)
+		// While we are at it, test if encoding/decoding works.
+		require.Equal(b, len(s.samples), c.NumSamples())
+		it := c.Iterator(nil)
+		var got []triple
+		for i := 0; it.Next() == ValFloat; i++ {
+			t, v := it.At()
+			if !stSupported {
+				// Some formats do not support ST, but we still want to test them.
+				// inject correct st for comparison purposes.
+				got = append(got, triple{st: s.samples[i].st, t: t, v: v})
+			} else {
+				got = append(got, triple{st: it.AtST(), t: t, v: v})
+			}
+		}
+		if err := it.Err(); err != nil && !errors.Is(err, io.EOF) {
+			require.NoError(b, err)
+		}
+		require.Equal(b, s.samples, got)
+
+		var sink float64
 		// Measure decoding efficiency.
 		for i := 0; b.Loop(); {
 			b.ReportMetric(float64(len(c.Bytes())), "B/chunk")
