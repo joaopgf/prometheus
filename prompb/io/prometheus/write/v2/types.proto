@@ -62,7 +62,6 @@ message TimeSeries {
   //
   // Note that there might be multiple TimeSeries objects in the same
   // Requests with the same labels e.g. for different exemplars, metadata
-  // or start timestamp.
   repeated uint32 labels_refs = 1;
 
   // Timeseries messages can either specify samples or (native) histogram samples
